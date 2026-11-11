@@ -2,6 +2,8 @@ import graphene
 from .apps import CALCULATION_RULES, CalculationConfig
 from .services import get_rule_name, get_parameters, get_linked_class
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
+from core.models.row_security import target_queryset
 
 
 class CalculationRulesGQLType(graphene.ObjectType):
@@ -151,10 +153,8 @@ class Query(graphene.ObjectType):
                 if calculation_rule.uuid == instance_id:
                     instance = calculation_rule
         else:
-            # get the instance class name to get instance object by uuid
-            instance_type = ContentType.objects.get(model__iexact=f'{instance_class_name}')
-            instance_class = instance_type.model_class()
-            instance = instance_class.objects.get(id=instance_id)
+            # only a class the rules link to `class_name`, and only a row the user may read
+            instance = get_linked_instance(info.context.user, class_name, instance_class_name, instance_id)
 
         list_params = []
         if class_name and instance:
@@ -227,6 +227,44 @@ class Query(graphene.ObjectType):
             if 'Product' in result_linked_class:
                 result_linked_class.remove('Product')
         return LinkedClassListGQLType(result_linked_class)
+
+
+def allowed_instance_classes(class_name):
+    """
+    The classes (lower case) whose instance may carry the calculation parameters of
+    `class_name`: the ones the calculation rules link to it (get_linked_class). Any
+    other model is not loaded at all.
+    """
+    if not class_name:
+        return set()
+    # on this release get_linked_class gives the signal results: (receiver, [class names])
+    return {
+        name.lower()
+        for _receiver, names in get_linked_class(class_name_list=[class_name])
+        for name in (names or []) if name
+    }
+
+
+def get_linked_instance(user, class_name, instance_class_name, instance_id):
+    """
+    The `instance_class_name` row `instance_id`, when the rules link that class to
+    `class_name` and `user` may read the row (the model's row security, through core
+    target_queryset); None otherwise, whatever the reason, so the query does not tell
+    a refused row from a missing one.
+    """
+    if not instance_class_name or not instance_id:
+        return None
+    if instance_class_name.lower() not in allowed_instance_classes(class_name):
+        return None
+    instance_type = ContentType.objects.filter(model__iexact=instance_class_name).first()
+    instance_class = instance_type.model_class() if instance_type else None
+    if instance_class is None:
+        return None
+    try:
+        return target_queryset(instance_class, user).filter(pk=instance_id).first()
+    except (ValueError, TypeError, ValidationError):
+        # not an id of that model
+        return None
 
 
 def _append_to_calcrule_list(list_cr, cr):
